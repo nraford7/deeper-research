@@ -25,6 +25,73 @@ _SATURATION_RE = re.compile(
 _EXPLICIT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$")
 
 
+def load_env_file(path=None, keys=None):
+    """Populate os.environ from a KEY=VALUE .env file for keys not already set.
+
+    ~/.env commonly assigns keys WITHOUT `export`, so a plain `. ~/.env` leaves them as
+    shell variables that this process — and the broker/worker children that inherit its
+    environment — never see. That was the root cause of the 2026-09 batch failures: both
+    Round-1 retrieval and the managed publish helper saw an empty EXA_API_KEY. Loading the
+    file straight into os.environ here makes every child inherit the keys. Returns the list
+    of names newly set.
+    """
+    path = Path(path) if path else Path.home() / ".env"
+    if not path.is_file():
+        return []
+    loaded = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        if "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        name = name.strip()
+        value = value.strip().strip('"').strip("'")
+        if keys is not None and name not in keys:
+            continue
+        if name and name not in os.environ:
+            os.environ[name] = value
+            loaded.append(name)
+    return loaded
+
+
+def recover_stranded_bible(job, emit=print):
+    """Recover a completed-but-unpublished Bible from transaction scratch into the run dir.
+
+    When the managed broker/lease dies at publish time (2026-09 failures), the pipeline has
+    already produced a full Bible under <library>/.transactions/<session>/scratch/.../ but
+    validate_completion(run_dir) fails because nothing was sealed into the run dir. Rather
+    than score a finished run 'failed' and strand the work, copy the completed workrun into
+    the run dir. Returns True if a Bible markdown now exists in the run dir.
+    """
+    import shutil
+
+    run_dir = Path(job.run_dir)
+    slug = job.slug
+    tx = run_dir.parent / ".transactions"
+    if not tx.is_dir():
+        return False
+    hits = list(tx.glob(f"**/RESEARCH-BIBLE_{slug}.md"))
+    if not hits:
+        return False
+    # prefer a primary workrun over an index_library copy, then the most complete tree
+    hits.sort(key=lambda p: ("index_library" in p.parts, -len(p.parts)))
+    src = hits[0].parent
+    for item in src.iterdir():
+        dest = run_dir / item.name
+        try:
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dest)
+        except OSError as exc:
+            emit(f"[batch] recover warning ({slug}): {exc}")
+    return (run_dir / f"RESEARCH-BIBLE_{slug}.md").is_file()
+
+
 def is_saturation_failure(returncode, log_text):
     """Return true only when a failed worker reports shared-capacity pressure."""
 
@@ -59,6 +126,7 @@ class BatchResult:
     peak_running: int
     saturation_events: int
     final_target: int
+    recovered: int = 0
 
 
 @dataclass
@@ -292,7 +360,7 @@ def run_batch(
 
     pending = deque(jobs)
     running = []
-    succeeded = failed = saturation_events = peak_running = 0
+    succeeded = failed = saturation_events = peak_running = recovered = 0
     source_env = os.environ if source_env is None else source_env
 
     while pending or running:
@@ -311,6 +379,20 @@ def run_batch(
             except Exception:
                 valid = False
             completed = returncode == 0 and valid
+            if returncode == 0 and not valid:
+                # The worker exited clean but nothing was sealed into the run dir — most
+                # often a dead broker/lease at publish time. Recover the finished Bible from
+                # transaction scratch instead of scoring a completed run 'failed'.
+                try:
+                    if recover_stranded_bible(active.job, emit):
+                        recovered += 1
+                        completed = True
+                        emit(
+                            f"[batch] recovered {active.job.slug} from scratch "
+                            f"(publish/broker failed; Bible copied into run dir, run left unsealed)"
+                        )
+                except Exception as exc:
+                    emit(f"[batch] recovery attempt failed for {active.job.slug}: {exc}")
             if completed:
                 succeeded += 1
                 emit(f"[batch] completed {active.job.slug}")
@@ -365,6 +447,7 @@ def run_batch(
         peak_running=peak_running,
         saturation_events=saturation_events,
         final_target=limit.target,
+        recovered=recovered,
     )
 
 
@@ -468,6 +551,29 @@ def main(argv=None):
     if not jobs:
         return 0
 
+    # Env preflight — the batch and its broker/worker children inherit THIS process's
+    # environment. ~/.env keys assigned without `export` never reach here via `. ~/.env`,
+    # which silently starved retrieval and the publish helper of EXA_API_KEY (2026-09
+    # failures). Load ~/.env directly, then fail loudly if the retrieval key is still absent.
+    if not os.environ.get("EXA_API_KEY"):
+        loaded = load_env_file()
+        if loaded:
+            print(f"[batch] loaded {len(loaded)} key(s) from ~/.env into the environment")
+    if not os.environ.get("EXA_API_KEY"):
+        parser.error(
+            "EXA_API_KEY is not set in this process's environment — retrieval and the publish "
+            "helper will fail. Export it before launching:  set -a; . ~/.env; set +a"
+        )
+    provider_keys = [
+        k for k in ("ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "XAI_API_KEY", "OPENAI_API_KEY")
+        if os.environ.get(k)
+    ]
+    if len(provider_keys) < 2:
+        print(
+            "[batch] WARNING: fewer than two LLM provider keys are set; the Round-4 "
+            "independent-family adversary may be unavailable (fail-closed)."
+        )
+
     result = run_batch(
         jobs,
         adapter=args.adapter,
@@ -478,8 +584,14 @@ def main(argv=None):
     )
     print(
         f"batch complete: succeeded={result.succeeded} failed={result.failed} "
-        f"peak={result.peak_running} final_target={result.final_target}"
+        f"recovered={result.recovered} peak={result.peak_running} final_target={result.final_target}"
     )
+    if result.recovered:
+        print(
+            f"[batch] NOTE: {result.recovered} run(s) completed but their publish step failed; "
+            "the Bible was recovered from scratch into the run dir. The managed run is unsealed "
+            "(metadata not finalized) — re-run finalize if you need a sealed run."
+        )
     return 1 if result.failed else 0
 
 

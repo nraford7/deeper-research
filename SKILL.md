@@ -983,6 +983,29 @@ python3 "$HOME/.agents/skills/deeper-research/scripts/batch_research.py" \
   questions.txt --adapter codex
 ```
 
+**Environment must be EXPORTED, not just sourced (2026-09 root cause).** The batch and
+every broker/worker child inherit THIS process's environment. `~/.env` commonly assigns
+keys *without* `export`, so a bare `. ~/.env` leaves them as shell variables the children
+never see — which silently starved Round-1 retrieval and the managed publish helper of
+`EXA_API_KEY` and made 6 runs fail. Launch with `set -a; . ~/.env; set +a` so the keys are
+exported. As a backstop, `batch_research.py` now runs an **env preflight**: if `EXA_API_KEY`
+is absent it loads `~/.env` directly into `os.environ`, and if it is still missing it exits
+with a clear error instead of launching doomed workers. It also warns when fewer than two
+LLM provider keys are set (the Round-4 independent-family adversary is fail-closed).
+
+**The `succeeded/failed` tally is not the whole truth — the runner now auto-recovers.** A
+run can complete its full pipeline (Bible, adversary, verification) and still fail only at
+the managed *publish* step when the run-manager broker/lease dies — leaving a finished Bible
+stranded under `<library>/.transactions/<session>/scratch/…`. `batch_research.py` now, on a
+clean exit whose run dir has no sealed Bible, sweeps that scratch, copies the completed
+workrun into the run dir, and counts the run as `recovered` (not `failed`); the summary line
+reports `recovered=N` and notes the run is left unsealed. If you are on an older build or the
+broker died mid-write, recover by hand: `find <library>/.transactions -name 'RESEARCH-BIBLE_<slug>.md'`
+and copy that workrun into the run dir. **Never trust a `failed` tally without first sweeping
+`.transactions/**` for completed Bibles.** On this machine the managed broker/lease layer is
+unreliable under concurrency; prefer low `--max-concurrency` (3–4) and, when it keeps dying,
+the unmanaged direct-script flow (`--run-dir` per the benchmark quickstart, no run_manager/broker).
+
 When a failed worker reports capacity/concurrency pressure or HTTP 429, the scheduler
 halves its target and pauses new launches for 120 seconds. It does not kill active work
 or automatically retry ordinary research, evidence-gate, or budget failures. Completed
@@ -1089,6 +1112,9 @@ When `$deeper-research [topic]` (Codex) or `/deeper-research [topic]` (Claude Co
 | Partial retrieval failure | `slice_search.py --resume` skips slices whose jsonl parses |
 | WebFetch hallucination | No-WebFetch rule — curl the raw page, grep/read the real text |
 | Silent stall in a network script | `CappedRetry` bounds Retry-After sleeps (30s); wrap long runs in `scripts/watched.py` (kills on stale output, exit 99) |
+| Keys sourced but not exported (`. ~/.env`) → empty `EXA_API_KEY` in children | Launch with `set -a; . ~/.env; set +a`; `batch_research.py` env-preflight loads `~/.env` and fails loudly if `EXA_API_KEY` is still missing |
+| Managed broker/lease dies at publish → finished Bible stranded in `.transactions/**/scratch` and scored "failed" | `batch_research.py` auto-recovers the stranded Bible into the run dir (`recovered=N`); sweep `.transactions/**` before trusting a `failed` tally; prefer low `--max-concurrency` or the unmanaged `--run-dir` flow |
+| Queued worker's lease expires before it starts | Lower `--max-concurrency` so late jobs are not held past their lease; or run unmanaged |
 
 ## Stall watchdog
 

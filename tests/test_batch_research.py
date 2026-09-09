@@ -389,3 +389,50 @@ def test_per_row_mode_overrides_global_mode(tmp_path, monkeypatch):
     )
     assert jobs[0].mode == "extend"
     assert seen[0]["mode"] == "extend"
+
+
+def test_load_env_file_populates_only_unset_keys(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text(
+        "# comment\n"
+        "export EXA_API_KEY=exa-123\n"
+        'ANTHROPIC_API_KEY="anthropic-xyz"\n'
+        "ALREADY_SET=from-file\n"
+        "MALFORMED_LINE\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ALREADY_SET", "from-env")
+
+    loaded = batch_research.load_env_file(env)
+
+    import os
+    assert os.environ["EXA_API_KEY"] == "exa-123"           # export prefix stripped
+    assert os.environ["ANTHROPIC_API_KEY"] == "anthropic-xyz"  # quotes stripped
+    assert os.environ["ALREADY_SET"] == "from-env"          # pre-set value not overwritten
+    assert set(loaded) == {"EXA_API_KEY", "ANTHROPIC_API_KEY"}
+    assert "MALFORMED_LINE" not in os.environ
+
+
+def test_recover_stranded_bible_pulls_completed_run_from_scratch(tmp_path):
+    library = tmp_path / "Deeper_Research"
+    run_dir = library / "my-topic"
+    run_dir.mkdir(parents=True)
+    (run_dir / "scope.json").write_text("{}", encoding="utf-8")  # partial run dir
+    # a completed workrun stranded in transaction scratch (broker died before publish)
+    workrun = library / ".transactions" / "session-abc" / "scratch" / "workrun"
+    (workrun / "sections").mkdir(parents=True)
+    (workrun / "RESEARCH-BIBLE_my-topic.md").write_text("# Bible\n", encoding="utf-8")
+    (workrun / "sections" / "01.md").write_text("body", encoding="utf-8")
+    # an index_library copy that must NOT be preferred over the primary workrun
+    idx = library / ".transactions" / "session-abc" / "scratch" / "index_library" / "my-topic"
+    idx.mkdir(parents=True)
+    (idx / "RESEARCH-BIBLE_my-topic.md").write_text("# stale copy\n", encoding="utf-8")
+
+    job = SimpleNamespace(run_dir=run_dir, slug="my-topic")
+    recovered = batch_research.recover_stranded_bible(job, emit=lambda *_: None)
+
+    assert recovered is True
+    assert (run_dir / "RESEARCH-BIBLE_my-topic.md").read_text(encoding="utf-8") == "# Bible\n"
+    assert (run_dir / "sections" / "01.md").is_file()
