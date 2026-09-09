@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import time
 
@@ -92,6 +93,20 @@ def recover_stranded_bible(job, emit=print):
     return (run_dir / f"RESEARCH-BIBLE_{slug}.md").is_file()
 
 
+def unmanaged_complete(run_dir, slug):
+    """A finished unmanaged run has a non-trivial Bible written straight into the run dir.
+
+    Unmanaged runs have no broker/metadata to validate against (that is the whole point),
+    so completion is simply: the Bible markdown exists and is non-trivial. The HTML is a
+    nice-to-have the exporter adds; its absence does not fail the run.
+    """
+    md = Path(run_dir) / f"RESEARCH-BIBLE_{slug}.md"
+    try:
+        return md.is_file() and md.stat().st_size > 2000
+    except OSError:
+        return False
+
+
 def is_saturation_failure(returncode, log_text):
     """Return true only when a failed worker reports shared-capacity pressure."""
 
@@ -109,6 +124,7 @@ class BatchJob:
     lease_token: str | None = None
     scratch_dir: Path | None = None
     action: str = "planned"
+    managed: bool = False
 
 
 @dataclass(frozen=True)
@@ -151,6 +167,7 @@ def prepare_jobs(
     library_dir=None,
     mode=None,
     dry_run=False,
+    managed=False,
 ):
     """Plan all jobs before creating batch artifacts or launching workers.
 
@@ -205,6 +222,23 @@ def prepare_jobs(
         unique_jobs.append((slug, row_mode, question))
     jobs = []
     for slug, row_mode, question in unique_jobs:
+        if not managed:
+            # Unmanaged (default): worker writes straight into <library>/<slug>. No broker,
+            # no lease, no scratch — the failure class those introduced (see SKILL.md). Skip
+            # a run whose Bible already exists (resumable); `fresh` clears and re-runs.
+            run_dir = library / slug
+            bible = run_dir / f"RESEARCH-BIBLE_{slug}.md"
+            if row_mode == "fresh" and run_dir.exists() and not dry_run:
+                shutil.rmtree(run_dir)
+            elif unmanaged_complete(run_dir, slug):
+                continue  # already complete
+            if not dry_run:
+                run_dir.mkdir(parents=True, exist_ok=True)
+            jobs.append(BatchJob(
+                question, slug, run_dir, logs_dir / f"{slug}.log", row_mode,
+                None, None, None, "planned", managed=False,
+            ))
+            continue
         try:
             prepared = prepare_run(
                 question=question,
@@ -232,12 +266,33 @@ def prepare_jobs(
             prepared.lease_token,
             prepared.scratch_dir,
             prepared.action,
+            managed=True,
         ))
     return jobs
 
 
 def _pipeline_prompt(adapter, job, skill_root):
     native = "Codex native subagents" if adapter == "codex" else "Claude native Agent subagents"
+    if not job.managed:
+        # Unmanaged (default): write straight into the run dir; no run_manager/broker/lease.
+        return (
+            f"Use the deeper-research skill at {skill_root} to run the FULL pipeline UNMANAGED "
+            f"(no run_manager, no broker, no lease) for this question, writing ALL outputs directly "
+            f"into {job.run_dir}. Invoke scripts as: PYTHONPATH={skill_root} python3 "
+            f"{skill_root}/scripts/<name>.py --run-dir {job.run_dir} ...  Never write under {skill_root}. "
+            f"Follow the benchmark-quickstart / legacy direct-script flow: scope.py -> slice_search.py -> "
+            f"evidence_gate.py (must exit 0) -> fetch_fulltext.py -> citation_chase.py -> coverage_audit.py "
+            f"-> re-run fetch_fulltext.py -> Round-2 synthesis subagent emitting the SIX EXACT headers to "
+            f"{job.run_dir}/round2/synthesis.md -> deepen_questions.py -> Round-3 integration (section planner "
+            f"+ isolated section subagents into {job.run_dir}/sections/ + dedup_bib.py) -> Round-4 "
+            f"verify_citations.py --check-urls, lint_background.py, sweep_numbers.py, then a REFUTE adversary "
+            f"on a provider whose family is INDEPENDENT from the synthesis family -> fix pass -> assemble "
+            f"{job.run_dir}/RESEARCH-BIBLE_{job.slug}.md from the sections + bibliography and build its .html "
+            f"with export.py standalone flags (--sections {job.run_dir}/sections --bibliography "
+            f"{job.run_dir}/sections/bibliography.md --output-dir {job.run_dir}). Use {native} for coverage, "
+            f"integration, and fixes. Headless: skip Stage-0 framing. Do not stop until "
+            f"{job.run_dir}/RESEARCH-BIBLE_{job.slug}.md exists. QUESTION: {job.question}"
+        )
     return (
         f"Use the deeper-research skill rooted at {skill_root} to run the FULL pipeline for "
         f"this question. Invoke every helper and dispatcher by its absolute path under "
@@ -374,13 +429,16 @@ def run_batch(
             active.log_handle.close()
             running.remove(active)
             log_text = active.job.log_path.read_text(encoding="utf-8", errors="replace")
-            try:
-                valid = completion_validator(active.job.run_dir).ok
-            except Exception:
-                valid = False
+            if active.job.managed:
+                try:
+                    valid = completion_validator(active.job.run_dir).ok
+                except Exception:
+                    valid = False
+            else:
+                valid = unmanaged_complete(active.job.run_dir, active.job.slug)
             completed = returncode == 0 and valid
-            if returncode == 0 and not valid:
-                # The worker exited clean but nothing was sealed into the run dir — most
+            if active.job.managed and returncode == 0 and not valid:
+                # Managed worker exited clean but nothing was sealed into the run dir — most
                 # often a dead broker/lease at publish time. Recover the finished Bible from
                 # transaction scratch instead of scoring a completed run 'failed'.
                 try:
@@ -492,6 +550,13 @@ def _parser():
         help="Pre-approved containment wrapper command; required for the Claude adapter",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--managed",
+        action="store_true",
+        help="Use the run-manager broker/lease pathway (atomic seal + isolation for a "
+        "shared service). OFF by default: local runs write straight to <library>/<slug> "
+        "with no broker/lease, avoiding the broker's failure class.",
+    )
     return parser
 
 
@@ -535,6 +600,7 @@ def main(argv=None):
             library_dir=args.library_dir,
             mode=args.mode,
             dry_run=args.dry_run,
+            managed=args.managed,
         )
     except ValueError as exc:
         parser.error(str(exc))

@@ -65,7 +65,7 @@ def test_only_failed_workers_with_capacity_signals_trigger_backoff(message):
 def test_prepare_jobs_isolates_slug_collisions_deduplicates_and_skips_completed(tmp_path):
     questions = [" Alpha / Beta? ", "Alpha Beta", "", "Alpha / Beta?"]
 
-    jobs = batch_research.prepare_jobs(questions, tmp_path)
+    jobs = batch_research.prepare_jobs(questions, tmp_path, managed=True)
 
     assert [job.question for job in jobs] == ["Alpha / Beta?", "Alpha Beta"]
     assert jobs[0].run_dir.name.startswith("alpha-beta-")
@@ -74,10 +74,10 @@ def test_prepare_jobs_isolates_slug_collisions_deduplicates_and_skips_completed(
     assert jobs[0].log_path.parent == tmp_path / "_batch" / "logs"
 
     with pytest.raises(ValueError, match="choose one of"):
-        batch_research.prepare_jobs(questions, tmp_path)
+        batch_research.prepare_jobs(questions, tmp_path, managed=True)
 
     reordered = batch_research.prepare_jobs(
-        ["Alpha Beta", "Alpha / Beta?"], tmp_path / "reordered"
+        ["Alpha Beta", "Alpha / Beta?"], tmp_path / "reordered", managed=True
     )
     original_slugs = {job.question: job.slug for job in jobs}
     reordered_slugs = {job.question: job.slug for job in reordered}
@@ -85,9 +85,9 @@ def test_prepare_jobs_isolates_slug_collisions_deduplicates_and_skips_completed(
 
 
 def test_prepare_jobs_keeps_slugs_stable_when_a_later_batch_adds_a_collision(tmp_path):
-    original = batch_research.prepare_jobs(["Alpha / Beta?"], tmp_path)
+    original = batch_research.prepare_jobs(["Alpha / Beta?"], tmp_path, managed=True)
     with pytest.raises(ValueError, match="choose one of"):
-        batch_research.prepare_jobs(["Alpha / Beta?", "Alpha Beta"], tmp_path)
+        batch_research.prepare_jobs(["Alpha / Beta?", "Alpha Beta"], tmp_path, managed=True)
 
 
 def test_prepare_jobs_accepts_explicit_slug_tsv_for_resuming_named_runs(tmp_path):
@@ -96,14 +96,14 @@ def test_prepare_jobs_accepts_explicit_slug_tsv_for_resuming_named_runs(tmp_path
         "shi-strategy\tWhat is shi?",
     ]
 
-    jobs = batch_research.prepare_jobs(lines, tmp_path)
+    jobs = batch_research.prepare_jobs(lines, tmp_path, managed=True)
 
     assert [job.slug for job in jobs] == ["wu-wei", "shi-strategy"]
     assert [job.question for job in jobs] == ["What is wu wei?", "What is shi?"]
     assert jobs[0].run_dir == tmp_path / "wu-wei"
 
     with pytest.raises(ValueError, match="choose one of"):
-        batch_research.prepare_jobs(lines, tmp_path)
+        batch_research.prepare_jobs(lines, tmp_path, managed=True)
 
 
 @pytest.mark.parametrize("line", ["../escape\tQuestion", "/absolute\tQuestion", "bad slug\tQuestion"])
@@ -113,7 +113,7 @@ def test_prepare_jobs_rejects_unsafe_explicit_slugs(tmp_path, line):
 
 
 def test_codex_invocation_is_workspace_scoped_and_scrubs_api_routing(tmp_path):
-    job = batch_research.prepare_jobs(["Why adaptive scheduling?"], tmp_path)[0]
+    job = batch_research.prepare_jobs(["Why adaptive scheduling?"], tmp_path, managed=True)[0]
     skill_root = tmp_path / "skill"
     skill_root.mkdir()
 
@@ -151,7 +151,7 @@ def test_codex_invocation_is_workspace_scoped_and_scrubs_api_routing(tmp_path):
 
 
 def test_claude_requires_a_contained_runner_and_scrubs_metered_routing(tmp_path):
-    job = batch_research.prepare_jobs(["How does containment work?"], tmp_path)[0]
+    job = batch_research.prepare_jobs(["How does containment work?"], tmp_path, managed=True)[0]
     skill_root = tmp_path / "skill"
     skill_root.mkdir()
 
@@ -192,6 +192,7 @@ def test_run_batch_ramps_real_workers_and_keeps_outputs_isolated(tmp_path):
     jobs = batch_research.prepare_jobs(
         ["Question one", "Question two", "Question three", "Question four"],
         tmp_path / "research",
+        managed=True,
     )
     skill_root = tmp_path / "skill"
     skill_root.mkdir()
@@ -236,6 +237,7 @@ def test_run_batch_backs_off_after_capacity_failure_without_killing_active_work(
     jobs = batch_research.prepare_jobs(
         ["Saturate", "Already active", "Wait for cooldown"],
         tmp_path / "research",
+        managed=True,
     )
     skill_root = tmp_path / "skill"
     skill_root.mkdir()
@@ -385,7 +387,7 @@ def test_per_row_mode_overrides_global_mode(tmp_path, monkeypatch):
 
     monkeypatch.setattr(batch_research, "prepare_run", fake_prepare)
     jobs = batch_research.prepare_jobs(
-        ["topic\textend\tNew question"], project_dir=tmp_path, mode="fresh", dry_run=True
+        ["topic\textend\tNew question"], project_dir=tmp_path, mode="fresh", dry_run=True, managed=True
     )
     assert jobs[0].mode == "extend"
     assert seen[0]["mode"] == "extend"
@@ -436,3 +438,33 @@ def test_recover_stranded_bible_pulls_completed_run_from_scratch(tmp_path):
     assert recovered is True
     assert (run_dir / "RESEARCH-BIBLE_my-topic.md").read_text(encoding="utf-8") == "# Bible\n"
     assert (run_dir / "sections" / "01.md").is_file()
+
+
+def test_prepare_jobs_unmanaged_is_the_default_and_uses_no_broker(tmp_path):
+    jobs = batch_research.prepare_jobs(["Why unmanaged?"], tmp_path)
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job.managed is False
+    assert job.run_dir == tmp_path / job.slug
+    assert job.run_dir.is_dir()                 # created, ready for --run-dir writes
+    assert job.broker_endpoint is None and job.lease_token is None and job.scratch_dir is None
+
+
+def test_prepare_jobs_unmanaged_skips_a_completed_run(tmp_path):
+    run_dir = tmp_path / "done-slug"
+    run_dir.mkdir()
+    (run_dir / "RESEARCH-BIBLE_done-slug.md").write_text("x" * 3000, encoding="utf-8")
+    jobs = batch_research.prepare_jobs(["done-slug\tAlready finished?"], tmp_path)
+    assert jobs == []                            # resumable: finished runs are skipped
+
+
+def test_unmanaged_invocation_targets_run_dir_with_an_unmanaged_prompt(tmp_path):
+    job = batch_research.prepare_jobs(["Ship it?"], tmp_path)[0]
+    skill_root = tmp_path / "skill"
+    skill_root.mkdir()
+    inv = batch_research.build_invocation("codex", job, skill_root)
+    assert inv.argv[:4] == ["codex", "exec", "-C", str(job.run_dir)]   # run dir, not scratch
+    assert inv.cwd == job.run_dir
+    assert "UNMANAGED" in inv.stdin_text and "no run_manager" in inv.stdin_text
+    assert "publish every artifact" not in inv.stdin_text and "read-only" not in inv.stdin_text
+    assert str(job.run_dir) in inv.stdin_text

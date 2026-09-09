@@ -975,7 +975,17 @@ wait until their writers exit.
 Use `scripts/batch_research.py`; do not replace it with a fixed-concurrency shell loop.
 Each input line may be a question or `existing-slug<TAB>question` when resuming named
 run directories. The default policy starts at two workers, adds one after each healthy
-60-second window, and caps at eight:
+60-second window, and caps at eight.
+
+**Mode: UNMANAGED by default; `--managed` is opt-in.** Each worker writes straight into
+`<library>/<slug>` via `--run-dir` — no run-manager broker, no lease, no scratch/publish
+step. This is the reliable path on a single machine and deliberately avoids the broker/lease
+failure class that stranded six runs in 2026-09 (dead socket at publish, lease expiry while
+queued, empty helper env). A finished unmanaged run is simply a non-trivial
+`RESEARCH-BIBLE_<slug>.md` in the run dir; already-complete runs are skipped (resumable),
+and a `fresh` row clears and re-runs. Pass **`--managed`** ONLY when you need the broker's
+atomic-seal + isolation guarantees for a shared/multi-tenant service — then all the broker
+caveats (socket lifetime, lease TTL, key propagation) and the auto-recovery below apply.
 
 ```bash
 cd /absolute/path/to/project/Deeper_Research
@@ -1002,9 +1012,10 @@ workrun into the run dir, and counts the run as `recovered` (not `failed`); the 
 reports `recovered=N` and notes the run is left unsealed. If you are on an older build or the
 broker died mid-write, recover by hand: `find <library>/.transactions -name 'RESEARCH-BIBLE_<slug>.md'`
 and copy that workrun into the run dir. **Never trust a `failed` tally without first sweeping
-`.transactions/**` for completed Bibles.** On this machine the managed broker/lease layer is
-unreliable under concurrency; prefer low `--max-concurrency` (3–4) and, when it keeps dying,
-the unmanaged direct-script flow (`--run-dir` per the benchmark quickstart, no run_manager/broker).
+`.transactions/**` for completed Bibles.** All of this applies to `--managed` only; the
+default unmanaged mode writes straight to the run dir and has no broker to strand work. If you
+do run `--managed`, keep `--max-concurrency` low (3–4) — the broker/lease layer is unreliable
+under concurrency on this machine.
 
 When a failed worker reports capacity/concurrency pressure or HTTP 429, the scheduler
 halves its target and pauses new launches for 120 seconds. It does not kill active work
