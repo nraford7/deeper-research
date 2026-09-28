@@ -6,6 +6,7 @@ pricing.  The TOML/.env loader and assignment engine in later modules consume th
 definitions to materialise runtime instances.
 """
 
+import math
 import os
 import random
 import shutil
@@ -455,6 +456,9 @@ class RunConfig:
     adversary: str                      # resolved adversary provider name
     synthesizer: str                    # resolved synthesis provider name
     adversary_warning: str | None
+    # Per-run USD cap for the one Exa Agent "ultra" scout (agent_scout.py).
+    # Separate from max_retrieval_usd; 0 turns the scout off.
+    agent_scout_usd: float = 10.0
 
 
 # Ship defaults for the Round-1 slice roster when no [slices.*] table is present.
@@ -526,6 +530,17 @@ def _resolve_adversary(chain, providers, synthesizer_name, host=None):
     return synthesizer_name, warning
 
 
+def _agent_scout_usd(run: dict) -> float:
+    """[run].agent_scout_usd: a finite number >= 0 (0 = scout off)."""
+    raw = run.get("agent_scout_usd", 10.0)
+    if isinstance(raw, bool):
+        raise ValueError("[run].agent_scout_usd must be a number, not a boolean")
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"[run].agent_scout_usd must be a finite number >= 0, got {raw!r}")
+    return value
+
+
 def load_run_config(toml_paths=None, env=None):
     """Load the [run] + [slices.*] tables into a RunConfig.
 
@@ -578,4 +593,5 @@ def load_run_config(toml_paths=None, env=None):
         adversary=adversary,
         synthesizer=synthesizer_name,
         adversary_warning=adversary_warning,
+        agent_scout_usd=_agent_scout_usd(run),
     )

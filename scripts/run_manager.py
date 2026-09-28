@@ -128,6 +128,7 @@ class PrepareResult:
 MANAGED_HELPERS: dict[str, tuple[str, str, frozenset[str]]] = {
     "scope": ("scripts.scope", "managed_scope", frozenset({"topic", "scope", "use_llm"})),
     "slice-search": ("scripts.managed_helpers", "managed_slice", frozenset({"topic", "resume", "max_retrieval_usd", "fresh_since", "only_slice", "query", "add_slice"})),
+    "agent-scout": ("scripts.managed_helpers", "managed_agent_scout", frozenset({"topic", "scope", "max_agent_usd", "max_seconds", "start_only"})),
     "fetch-fulltext": ("scripts.managed_helpers", "managed_fetch_fulltext", frozenset({"min_chars", "max_bytes", "max_chars", "timeout"})),
     "citation-chase": ("scripts.managed_helpers", "managed_citation_chase", frozenset({"topic", "max_seeds", "max_candidates", "forward", "openalex_call_ceiling"})),
     "coverage-audit": ("scripts.managed_helpers", "managed_coverage_audit", frozenset({"topic", "max_audit_rounds", "audit_usd", "use_matrix", "current_year"})),
