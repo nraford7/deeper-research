@@ -145,7 +145,9 @@ Round -1   FRAME            (default-on, skippable) coach the umbrella question 
               ↓             sub-questions + scope before any spend — host-native questions
 Round 0    SCOPE            scope.py → scope.json (domain + source priorities)
               ↓
-Round 1    RETRIEVE         slice_search.py → Exa slices (full text) + academic anchor
+Round 1    RETRIEVE         agent_scout.py --start-only → one Exa Agent ultra run starts (runs in background)
+              ↓             slice_search.py → Exa slices (full text) + academic anchor
+              ↓             agent_scout.py → collect the scout's sources as slice_agent_scout.jsonl
               ↓             fetch_fulltext.py → download full text of EVERY source (keep longest; save raw)
               ↓             evidence_gate.py → MUST pass (exit 0) before any synthesis
               ↓             citation_chase.py → OpenAlex → Semantic Scholar fallback → explicit degraded mode, re-gate
@@ -239,6 +241,22 @@ python3 dispatch.py \
 The printed sequence is `scope.py → slice_search.py → evidence_gate.py`, each line
 runnable as-printed (topic, run-dir, and the retrieval cap are threaded through).
 
+**Step 1.1b — start the agent scout (default-on).** Right after scoping, start one
+Exa Agent `ultra` run, then go straight on to Step 1.2 while it works (20–45 min):
+
+```bash
+python3 scripts/agent_scout.py --run-dir research/[slug] \
+  --topic "Your topic" --scope "Your scope" --start-only
+```
+
+In managed runs use `run_manager.py invoke-helper --helper agent-scout` with
+`{"topic": ..., "scope": ..., "start_only": true}`. The scout has its own ledger
+(`agent_ledger.json`) and cap: `[run].agent_scout_usd` (default **$10**) or
+`--max-agent-usd`; `0` turns it off. Skip it when the user asked for a quick or cheap
+run, and ask before using it on a confidential client question (the question text
+goes to Exa, as with every search). Why: on 2026-09-28 one ultra run found 54 sources
+a finished Bible lacked; re-running its searches at 100 results each found only 11 of them.
+
 **Step 1.2 — retrieve.** `slice_search.py` fires one Exa `/search` per ENABLED slice,
 tiers + dedupes results, and writes `round1/slice_<name>.jsonl`, `round1/brief_<name>.md`,
 and `round1/evidence_manifest.json`. It also writes a free academic anchor
@@ -259,6 +277,16 @@ python3 scripts/slice_search.py \
   --fresh-since 2024-01-01 \   # optional; adds startPublishedDate to the news slice
   --resume                     # optional; skip slices whose jsonl already parses
 ```
+
+**Step 1.2b — collect the agent scout.** Before the evidence gate, run the same
+command without `--start-only` (managed: `start_only` false). It resumes the saved run
+id (`agent_scout_run.json`), polls until done, and writes `round1/slice_agent_scout.jsonl`
++ `brief_agent_scout.md` in the normal slice schema, so full-text fetch, the gate,
+citation chase and the coverage audit all see these sources. Only URLs, titles, years,
+authors and a one-line finding are kept; the agent's prose never enters the corpus.
+A failed run writes an empty slice and exits 0 (never retried for this run dir). In
+managed mode this call blocks until the run finishes, so keep renewing the lease while
+it polls.
 
 Default slice roster: `publication`, `news`, `institutional` ON; `financial`,
 `personal-site` OFF. Each slice sets EITHER an Exa `category` OR an
@@ -826,6 +854,7 @@ Each Exa call is pre-charged at fee × retry-multiplier = **$0.02 × 2 = $0.04**
 | Round 1 academic anchor | 1 (OpenAlex + S2) | $0.00 | $0.00 |
 | Round 2.5 deepening | up to 9 questions | $0.04 | ≈ $0.36 |
 | **Retrieval subtotal** | | | **≈ $0.56 (< $1 cap)** |
+| Round 1 agent scout (own ledger, `agent_ledger.json`) | 1 Exa Agent ultra run | metered | ≤ `agent_scout_usd` (default $10; 0 = off) |
 
 Metered LLM legs (synthesis / integration / adversary, including every generic fallback
 and any explicit configured executor) are covered separately by `--max-cost-usd` on
@@ -1048,7 +1077,9 @@ under the $1 cap):
 TOPIC="grid-scale battery storage economics 2024–2026"
 RUN=research/grid-battery
 python3 scripts/scope.py --topic "$TOPIC" --scope "LCOE trends, chemistry mix, capacity buildout, policy drivers" --output "$RUN/scope.json"
+python3 scripts/agent_scout.py --run-dir "$RUN" --topic "$TOPIC" --scope "..." --start-only   # ≤ $10, own ledger
 python3 scripts/slice_search.py --run-dir "$RUN" --topic "$TOPIC" --max-retrieval-usd 1
+python3 scripts/agent_scout.py --run-dir "$RUN" --topic "$TOPIC"   # collect → slice_agent_scout.jsonl
 python3 scripts/evidence_gate.py --run-dir "$RUN"        # must exit 0 before synthesis
 python3 scripts/fetch_fulltext.py --run-dir "$RUN"       # download full text of every source (keep longest; save raw)
 python3 scripts/citation_chase.py --run-dir "$RUN" --topic "$TOPIC"   # OpenAlex → tested Semantic Scholar fallback → explicit degraded status if both fail; inspect citation_chase_status.json; exit 22 remains fail-closed

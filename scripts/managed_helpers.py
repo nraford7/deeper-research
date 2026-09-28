@@ -35,6 +35,19 @@ def managed_slice(*, layout, fs, typed_args):
         return {"exit_code": slice_search.main(argv)}
 
 
+def managed_agent_scout(*, layout, fs, typed_args):
+    from scripts import agent_scout
+    _guard(layout)
+    argv = ["--run-dir", str(layout.run_root), "--topic", typed_args["topic"]]
+    for key, flag in (
+        ("scope", "--scope"), ("max_agent_usd", "--max-agent-usd"),
+        ("max_seconds", "--max-seconds"), ("start_only", "--start-only"),
+    ):
+        _flag(argv, flag, typed_args.get(key))
+    with broker_managed_context():
+        return {"exit_code": agent_scout.main(argv)}
+
+
 def managed_fetch_fulltext(*, layout, fs, typed_args):
     from scripts import fetch_fulltext
     _guard(layout)

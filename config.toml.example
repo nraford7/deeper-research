@@ -92,6 +92,7 @@ family       = "anthropic"                         # same lineage as the metered
 # [run]
 # mode                = "slices"   # the only supported mode; any other value errors
 # max_retrieval_usd   = 1.0        # per-run hard money cap on Exa retrieval
+# agent_scout_usd     = 10.0       # cap for the one Exa Agent ultra scout (own ledger); 0 = off
 # min_evidence_total  = 10         # gate: minimum globally-unique evidence items
 # min_nonempty_slices = 2          # gate: minimum slices that returned ≥1 item
 # adversary           = ["grok", "chatgpt", "gemini"]  # walked in order; the first
