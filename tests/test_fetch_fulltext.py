@@ -300,6 +300,33 @@ def test_strip_surrogates_replaces_only_unencodable_text():
     assert ff._strip_surrogates("half \ud83d emoji") == "half � emoji"
 
 
+def test_pdf_to_text_replaces_a_lone_surrogate_from_pypdf(monkeypatch):
+    """The real extractor, with pypdf stubbed at the module boundary: a page
+    whose extract_text() carries half an emoji must come back UTF-8 encodable.
+    ingest_local calls _pdf_to_text directly, with no sanitizer after it."""
+    import sys
+    import types
+
+    class _Page:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _Reader:
+        def __init__(self, _stream):
+            self.pages = [_Page("Page one \ud83d broken emoji"), _Page("Page two fine")]
+
+    fake_pypdf = types.ModuleType("pypdf")
+    fake_pypdf.PdfReader = _Reader
+    monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+    text = ff._pdf_to_text(b"%PDF-1.4 whatever")
+    assert text == "Page one \ufffd broken emoji\nPage two fine"
+    text.encode("utf-8")   # must not raise
+
+
 def test_lone_surrogate_in_pdf_text_does_not_sink_the_pass(monkeypatch, tmp_path):
     """Issue #8: pypdf can hand back a lone UTF-16 surrogate; write_text then
     raised UnicodeEncodeError outside the per-row try and the whole full-text
