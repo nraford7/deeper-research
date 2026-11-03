@@ -153,22 +153,32 @@ def split_keyed_entry(entry: str):
 
 
 _ET_AL_RE = re.compile(r"\bet\s+al\b\.?")
+# Lowercase surname particles, as in the citation grammar's [van der Berg, 2020].
+_SURNAME_PARTICLES = frozenset(
+    "van von der den de del della di da du dos das le la al bin ibn ter ten".split())
+
+
+def _is_surname(piece: str) -> bool:
+    """One surname, allowing lowercase particles before it (``van der Berg``)."""
+    words = piece.split()
+    return len([w for w in words[:-1] if w not in _SURNAME_PARTICLES]) == 0
 
 
 def _split_head(authors: str):
     """(names, others, organisation) for a keyed head. ``names`` are the
     pieces between separators; ``others`` is True for ``et al.``. A head is an
-    organisation when any piece has more than one word: a surname list
-    (``Babuta, Oswald & Janjeva``) is single words, while ``Bill and Melinda
-    Gates Foundation`` or ``Ministry of Defence, Japan`` is not, and splitting
-    those would invent authors. An organisation whose pieces are all single
+    organisation when any piece is more than one surname: a surname list
+    (``Babuta, Oswald & Janjeva``, ``van der Berg & Smith``) is single
+    surnames, with lowercase particles allowed, while ``Bill and Melinda Gates
+    Foundation`` or ``Ministry of Defence, Japan`` is not, and splitting those
+    would invent authors. An organisation whose pieces are all single
     words (``Ernst & Young``) still reads as a surname list; the raw head stays
     in the ``note`` field."""
     text = authors.strip()
     others = bool(_ET_AL_RE.search(text))
     text = _ET_AL_RE.sub("", text).strip(" ,;")
     names = [n.strip() for n in _AUTHOR_SPLIT_RE.split(text) if n.strip()]
-    organisation = any(len(n.split()) > 1 for n in names)
+    organisation = not all(_is_surname(n) for n in names)
     if organisation:
         names = [text]
     return names, others, organisation

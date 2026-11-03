@@ -592,3 +592,16 @@ def test_preflight_failure_leaves_prior_answers_in_place(monkeypatch, tmp_path):
     assert rc == deepen_questions.EXA_PREFLIGHT_EXIT
     assert (tmp_path / "round2_5" / "answer_00_gap.md").exists()
     assert not (tmp_path / "round2_5" / "superseded").exists()
+
+
+def test_two_archives_in_one_second_both_survive(monkeypatch, tmp_path):
+    r25 = tmp_path / "round2_5"
+    r25.mkdir()
+    monkeypatch.setattr(deepen_questions.time, "strftime", lambda *a: "20261103T090000Z")
+    (r25 / "answer_00_gap.md").write_text("first")
+    assert deepen_questions._set_aside_prior_answers(r25) == 1
+    (r25 / "answer_00_gap.md").write_text("second")
+    assert deepen_questions._set_aside_prior_answers(r25) == 1
+    sup = r25 / "superseded"
+    assert (sup / "20261103T090000Z" / "answer_00_gap.md").read_text() == "first"
+    assert (sup / "20261103T090000Z-2" / "answer_00_gap.md").read_text() == "second"

@@ -120,6 +120,23 @@ def _strip_surrogates(text: str) -> str:
     return _SURROGATE_RE.sub("\ufffd", text)
 
 
+def _write_atomic(path: Path, data) -> None:
+    """Write ``data`` (str as UTF-8, or bytes) to a temporary sibling, then
+    os.replace it into place. A failed write never truncates the file already
+    there (often the Exa snippet slice_search saved under the same name)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        if isinstance(data, str):
+            tmp.write_text(data, encoding="utf-8")
+        else:
+            tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def _pdf_to_text(data: bytes) -> str:
     try:
         import pypdf
@@ -386,11 +403,10 @@ def process_run(run_dir: Path, min_chars: int, max_bytes: int,
             # Persist the original downloaded document whenever we got one,
             # regardless of whether its extracted text beats the Exa snippet.
             if raw is not None:
-                sources_dir.mkdir(parents=True, exist_ok=True)
                 base = _source_filename(row)[:-4]  # strip trailing '.txt'
                 raw_name = f"{base}.{ext or 'bin'}"
                 try:
-                    (sources_dir / raw_name).write_bytes(raw)
+                    _write_atomic(sources_dir / raw_name, raw)
                 except OSError as exc:
                     # One unwritable file must not sink the pass (issue #8).
                     print(f"  ⚠ raw write failed ({type(exc).__name__})  {url}",
@@ -406,10 +422,9 @@ def process_run(run_dir: Path, min_chars: int, max_bytes: int,
             # Keep the longer text: our direct fetch vs. the existing Exa snippet.
             write_error = None
             if text and len(text) > existing_chars:
-                sources_dir.mkdir(parents=True, exist_ok=True)
                 fname = _source_filename(row)
                 try:
-                    (sources_dir / fname).write_text(text, encoding="utf-8")
+                    _write_atomic(sources_dir / fname, text)
                 except (OSError, UnicodeError) as exc:
                     # Fail open per row: any write error (not just a surrogate
                     # the sanitizer missed) skips this row, never the pass.

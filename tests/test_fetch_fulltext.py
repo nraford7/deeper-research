@@ -383,7 +383,7 @@ def test_write_errors_skip_the_row_not_the_pass(monkeypatch, tmp_path):
         return real_write_text(self, data, *a, **k)
 
     def write_bytes(self, data):
-        if self.suffix == ".pdf":
+        if ".pdf" in self.name:
             raise OSError(13, "Permission denied")
         return real_write_bytes(self, data)
 
@@ -404,3 +404,59 @@ def test_write_errors_skip_the_row_not_the_pass(monkeypatch, tmp_path):
     assert "raw_path" not in out["rawbad.pdf"] and "text_path" in out["rawbad.pdf"]
     assert "text_path" in out["good"]
     assert (tmp_path / "round1" / "fulltext_manifest.json").exists()
+
+
+def test_unwritable_sources_dir_skips_rows_not_the_pass(monkeypatch, tmp_path):
+    """The sources dir cannot be created (a file sits at its path): every row
+    is skipped as a write error and the manifest is still written."""
+    _write_slice(tmp_path, "web", [
+        {"url": "https://a.com/one", "slice": "web", "text_chars": 0, "tier": "web"},
+        {"url": "https://a.com/two.pdf", "slice": "web", "text_chars": 0, "tier": "web"}])
+    (tmp_path / "round1" / "sources").write_text("not a directory")
+
+    def fake_get(url, mb, to):
+        if url.endswith(".pdf"):
+            return b"%PDF-1.4 fake", "application/pdf", url
+        return ("Readable body text follows. " * 50).encode(), "text/html", url
+
+    monkeypatch.setattr(ff, "_safe_get", fake_get)
+    monkeypatch.setattr(ff, "_pdf_to_text", lambda data: "PDF body text. " * 60)
+    summary = ff.process_run(tmp_path, min_chars=400, max_bytes=10_000_000,
+                             max_chars=20_000, timeout=5)
+    assert summary["attempted"] == 2 and summary["fetched"] == 0
+    assert sum(summary["failures"].values()) == 2
+    assert all(k.startswith("write-error:") for k in summary["failures"])
+    assert (tmp_path / "round1" / "fulltext_manifest.json").exists()
+
+
+def test_failed_write_keeps_the_existing_snippet_file(monkeypatch, tmp_path):
+    """A write that dies part-way must not truncate the Exa snippet that
+    slice_search already saved under the same filename."""
+    from pathlib import Path
+    from scripts.slice_search import _source_filename
+
+    row = {"url": "https://a.com/page", "slice": "web", "tier": "web",
+           "text_chars": 12}
+    fname = _source_filename(row)
+    row["text_path"] = f"sources/{fname}"
+    _write_slice(tmp_path, "web", [row])
+    existing = tmp_path / "round1" / "sources" / fname
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text("Exa snippet.", encoding="utf-8")
+
+    monkeypatch.setattr(ff, "_safe_get", lambda url, mb, to: (
+        ("Readable body text follows. " * 50).encode(), "text/html", url))
+    real_write_text = Path.write_text
+
+    def half_then_fail(self, data, *a, **k):
+        if "Readable body" in data:
+            real_write_text(self, data[: len(data) // 2], *a, **k)
+            raise OSError(28, "No space left on device")
+        return real_write_text(self, data, *a, **k)
+
+    monkeypatch.setattr(Path, "write_text", half_then_fail)
+    summary = ff.process_run(tmp_path, min_chars=400, max_bytes=10_000_000,
+                             max_chars=20_000, timeout=5)
+    assert summary["failures"] == {"write-error:OSError": 1}
+    assert existing.read_text(encoding="utf-8") == "Exa snippet."
+    assert not list(existing.parent.glob("*.tmp"))

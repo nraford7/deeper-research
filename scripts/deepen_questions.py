@@ -570,8 +570,18 @@ def _set_aside_prior_answers(round25_dir):
              if p.is_file() and _ANSWER_INDEX_RE.match(p.name)]
     if not stale:
         return 0
-    dest = round25_dir / "superseded" / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    dest.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    (round25_dir / "superseded").mkdir(parents=True, exist_ok=True)
+    dest, n = round25_dir / "superseded" / stamp, 1
+    while True:
+        # Create the folder exclusively: two passes in one second must never
+        # share a folder, or the later move would overwrite the earlier files.
+        try:
+            dest.mkdir()
+            break
+        except FileExistsError:
+            n += 1
+            dest = round25_dir / "superseded" / f"{stamp}-{n}"
     for p in stale:
         p.replace(dest / p.name)
     print(f"  · moved {len(stale)} earlier Round-2.5 file(s) to "

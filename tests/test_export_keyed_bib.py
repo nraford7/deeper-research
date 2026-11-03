@@ -185,3 +185,15 @@ def test_year_suffix_stays_in_key_not_in_year_field():
     bt = to_bibtex_entry(entry, {})
     assert bt.startswith("@misc{Smith2024a,")
     assert _fields(bt)["year"] == "2024"
+
+
+def test_compound_surnames_stay_a_surname_list():
+    from scripts.export import _bibtex_author_field as field
+    entry = "[van der Berg and Smith, 2024] — A study — https://x.org/s [paper · research]"
+    bt = to_bibtex_entry(entry, {})
+    assert bt.startswith("@misc{vanderBerg2024,")
+    assert "author    = {van der Berg and Smith}" in bt
+    assert field("van der Berg") == "van der Berg"
+    assert field("de la Cruz & von Neumann") == "de la Cruz and von Neumann"
+    # a capitalised word before the surname is not a particle: organisation
+    assert field("Ministry of Defence") == "{Ministry of Defence}"
