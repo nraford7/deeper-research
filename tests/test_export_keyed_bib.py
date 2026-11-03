@@ -137,3 +137,16 @@ def test_historical_year_takes_the_keyed_path_end_to_end():
     assert f["author"] == "Darwin" and f["year"] == "1859"
     assert f["title"] == "On the Origin of Species"
     assert f["keywords"] == "book, primary"
+
+
+def test_historical_keyed_line_without_url_is_kept():
+    """parse_bib_entries used to require a 19xx/20xx year, a URL or n.d.; a
+    keyed [Darwin, 1859] with no URL was dropped before export."""
+    bib = "- [Darwin, 1859] — On the Origin of Species. London: John Murray. [book · primary]\n"
+    entries = parse_bib_entries(bib)
+    assert len(entries) == 1
+    bt = to_bibtex_entry(entries[0], {})
+    assert bt.startswith("@misc{Darwin1859,")
+    f = _fields(bt)
+    assert f["year"] == "1859"
+    assert f["title"] == "On the Origin of Species. London: John Murray"

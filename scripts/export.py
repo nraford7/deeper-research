@@ -86,9 +86,11 @@ def parse_bib_entries(text: str):
             continue
         # A real academic entry has a 4-digit year. A WEB entry may be undated
         # (n.d.) — accept it when it carries a URL or an explicit n.d. marker so
-        # year-less web sources are not silently dropped.
+        # year-less web sources are not silently dropped. A keyed head
+        # ([Darwin, 1859] — …) is an entry whatever its year.
         if not YEAR_RE.search(body):
-            if not (URL_RE.search(body) or "n.d." in body.lower()):
+            if not (URL_RE.search(body) or "n.d." in body.lower()
+                    or _KEYED_HEAD_RE.match(body)):
                 continue
         entries.append(body)
     return entries
@@ -154,7 +156,10 @@ def _bibtex_authors_from_head(authors: str) -> str:
     """BibTeX author field from a keyed head: names joined with ``and``, which
     is the only separator BibTeX reads (``Babuta, Oswald & Janjeva`` →
     ``Babuta and Oswald and Janjeva``; ``Smith et al.`` → ``Smith and others``).
-    A single name or an organisation passes through unchanged."""
+    A head with no separator passes through unchanged. The head grammar has
+    no person/organisation marker, so an organisation whose own name holds a
+    separator (``Ernst & Young``) is split like a list of surnames; the raw
+    head stays in the ``note`` field."""
     text = authors.strip()
     others = bool(re.search(r"\bet\s+al\b\.?", text))
     text = re.sub(r"\bet\s+al\b\.?", "", text)
