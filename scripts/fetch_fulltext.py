@@ -107,6 +107,19 @@ def _html_to_text(data: bytes) -> str:
     return parser.text()
 
 
+_SURROGATE_RE = re.compile("[\\ud800-\\udfff]")
+
+
+def _strip_surrogates(text: str) -> str:
+    """Replace lone UTF-16 surrogates (half an emoji from a broken PDF font
+    map) with U+FFFD. ``write_text(encoding="utf-8")`` raises
+    UnicodeEncodeError on them, and one such document would otherwise sink the
+    whole full-text pass instead of failing open per row."""
+    if not text or not _SURROGATE_RE.search(text):
+        return text
+    return _SURROGATE_RE.sub("\ufffd", text)
+
+
 def _pdf_to_text(data: bytes) -> str:
     try:
         import pypdf
@@ -128,7 +141,7 @@ def _pdf_to_text(data: bytes) -> str:
                 continue
     except Exception as exc:  # noqa: BLE001 — the pages tree itself can be malformed
         print(f"  ⚠ PDF pages unreadable ({type(exc).__name__})", file=sys.stderr)
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    return _strip_surrogates(re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip())
 
 
 def _looks_like_pdf(url: str, content_type: str, data: bytes) -> bool:
@@ -366,6 +379,9 @@ def process_run(run_dir: Path, min_chars: int, max_bytes: int,
             )
             text, method, raw, ext = _fetch_row_text(
                 url, is_academic, max_bytes, max_chars, timeout, row=row)
+            # Belt and braces for the write below: whatever the extractor
+            # returned, the row must stay fail-open (see _strip_surrogates).
+            text = _strip_surrogates(text)
 
             # Persist the original downloaded document whenever we got one,
             # regardless of whether its extracted text beats the Exa snippet.

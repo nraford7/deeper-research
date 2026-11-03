@@ -289,3 +289,45 @@ def test_no_verify_false_in_source():
     from pathlib import Path
     src = (Path(__file__).resolve().parent.parent / "scripts" / "fetch_fulltext.py").read_text()
     assert "verify=False" not in src, "TLS verification must never be disabled"
+
+
+# --- lone surrogates (issue #8) ---------------------------------------------
+
+def test_strip_surrogates_replaces_only_unencodable_text():
+    clean = "plain text with an emoji \U0001F600 and accents é"
+    assert ff._strip_surrogates(clean) is clean          # untouched, same object
+    assert ff._strip_surrogates("") == ""
+    assert ff._strip_surrogates("half \ud83d emoji") == "half � emoji"
+
+
+def test_lone_surrogate_in_pdf_text_does_not_sink_the_pass(monkeypatch, tmp_path):
+    """Issue #8: pypdf can hand back a lone UTF-16 surrogate; write_text then
+    raised UnicodeEncodeError outside the per-row try and the whole full-text
+    pass died with no manifest. The row must be written (U+FFFD in place of the
+    surrogate) and the rows after it must still be attempted."""
+    bad = {"url": "https://a.com/bad.pdf", "slice": "web", "text_chars": 0, "tier": "web"}
+    good = {"url": "https://a.com/good", "slice": "web", "text_chars": 0, "tier": "web"}
+    _write_slice(tmp_path, "web", [bad, good])
+
+    html_body = "Readable body text follows. " * 50
+
+    def fake_get(url, mb, to):
+        if url.endswith(".pdf"):
+            return b"%PDF-1.4 fake", "application/pdf", url
+        return html_body.encode(), "text/html", url
+
+    monkeypatch.setattr(ff, "_safe_get", fake_get)
+    monkeypatch.setattr(ff, "_pdf_to_text",
+                        lambda data: ("Extracted text \ud83d with half an emoji. " * 40))
+
+    summary = ff.process_run(tmp_path, min_chars=400, max_bytes=10_000_000,
+                             max_chars=20_000, timeout=5)
+    assert summary["attempted"] == 2 and summary["fetched"] == 2
+
+    rows = [json.loads(l) for l in
+            (tmp_path / "round1" / "slice_web.jsonl").read_text().splitlines() if l.strip()]
+    bad_row = next(r for r in rows if r["url"].endswith("bad.pdf"))
+    written = (tmp_path / "round1" / bad_row["text_path"]).read_text(encoding="utf-8")
+    assert "�" in written and "\ud83d" not in written
+    assert bad_row["text_chars"] == len(written)
+    assert (tmp_path / "round1" / "fulltext_manifest.json").exists()
