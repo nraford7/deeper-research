@@ -289,3 +289,118 @@ def test_no_verify_false_in_source():
     from pathlib import Path
     src = (Path(__file__).resolve().parent.parent / "scripts" / "fetch_fulltext.py").read_text()
     assert "verify=False" not in src, "TLS verification must never be disabled"
+
+
+# --- lone surrogates (issue #8) ---------------------------------------------
+
+def test_strip_surrogates_replaces_only_unencodable_text():
+    clean = "plain text with an emoji \U0001F600 and accents é"
+    assert ff._strip_surrogates(clean) is clean          # untouched, same object
+    assert ff._strip_surrogates("") == ""
+    assert ff._strip_surrogates("half \ud83d emoji") == "half � emoji"
+
+
+def test_pdf_to_text_replaces_a_lone_surrogate_from_pypdf(monkeypatch):
+    """The real extractor, with pypdf stubbed at the module boundary: a page
+    whose extract_text() carries half an emoji must come back UTF-8 encodable.
+    ingest_local calls _pdf_to_text directly, with no sanitizer after it."""
+    import sys
+    import types
+
+    class _Page:
+        def __init__(self, text):
+            self._text = text
+
+        def extract_text(self):
+            return self._text
+
+    class _Reader:
+        def __init__(self, _stream):
+            self.pages = [_Page("Page one \ud83d broken emoji"), _Page("Page two fine")]
+
+    fake_pypdf = types.ModuleType("pypdf")
+    fake_pypdf.PdfReader = _Reader
+    monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+    text = ff._pdf_to_text(b"%PDF-1.4 whatever")
+    assert text == "Page one \ufffd broken emoji\nPage two fine"
+    text.encode("utf-8")   # must not raise
+
+
+def test_lone_surrogate_in_pdf_text_does_not_sink_the_pass(monkeypatch, tmp_path):
+    """Issue #8: pypdf can hand back a lone UTF-16 surrogate; write_text then
+    raised UnicodeEncodeError outside the per-row try and the whole full-text
+    pass died with no manifest. The row must be written (U+FFFD in place of the
+    surrogate) and the rows after it must still be attempted."""
+    bad = {"url": "https://a.com/bad.pdf", "slice": "web", "text_chars": 0, "tier": "web"}
+    good = {"url": "https://a.com/good", "slice": "web", "text_chars": 0, "tier": "web"}
+    _write_slice(tmp_path, "web", [bad, good])
+
+    html_body = "Readable body text follows. " * 50
+
+    def fake_get(url, mb, to):
+        if url.endswith(".pdf"):
+            return b"%PDF-1.4 fake", "application/pdf", url
+        return html_body.encode(), "text/html", url
+
+    monkeypatch.setattr(ff, "_safe_get", fake_get)
+    monkeypatch.setattr(ff, "_pdf_to_text",
+                        lambda data: ("Extracted text \ud83d with half an emoji. " * 40))
+
+    summary = ff.process_run(tmp_path, min_chars=400, max_bytes=10_000_000,
+                             max_chars=20_000, timeout=5)
+    assert summary["attempted"] == 2 and summary["fetched"] == 2
+
+    rows = [json.loads(l) for l in
+            (tmp_path / "round1" / "slice_web.jsonl").read_text().splitlines() if l.strip()]
+    bad_row = next(r for r in rows if r["url"].endswith("bad.pdf"))
+    written = (tmp_path / "round1" / bad_row["text_path"]).read_text(encoding="utf-8")
+    assert "�" in written and "\ud83d" not in written
+    assert bad_row["text_chars"] == len(written)
+    assert (tmp_path / "round1" / "fulltext_manifest.json").exists()
+
+
+def test_write_errors_skip_the_row_not_the_pass(monkeypatch, tmp_path):
+    """Any per-row write error (full disk, bad path), not only a surrogate,
+    must skip that row and leave the rest of the pass and its manifest intact."""
+    from pathlib import Path
+
+    rows = [{"url": f"https://a.com/{n}", "slice": "web", "text_chars": 0, "tier": "web"}
+            for n in ("bad", "rawbad.pdf", "good")]
+    _write_slice(tmp_path, "web", rows)
+
+    def fake_get(url, mb, to):
+        if url.endswith(".pdf"):
+            return b"%PDF-1.4 fake", "application/pdf", url
+        tag = "POISON " if url.endswith("/bad") else ""
+        return (f"{tag}Readable body text follows. " * 50).encode(), "text/html", url
+
+    real_write_text, real_write_bytes = Path.write_text, Path.write_bytes
+
+    def write_text(self, data, *a, **k):
+        if "POISON" in data:
+            raise OSError(28, "No space left on device")
+        return real_write_text(self, data, *a, **k)
+
+    def write_bytes(self, data):
+        if self.suffix == ".pdf":
+            raise OSError(13, "Permission denied")
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(ff, "_safe_get", fake_get)
+    monkeypatch.setattr(ff, "_pdf_to_text", lambda data: "PDF body text. " * 60)
+    monkeypatch.setattr(Path, "write_text", write_text)
+    monkeypatch.setattr(Path, "write_bytes", write_bytes)
+
+    summary = ff.process_run(tmp_path, min_chars=400, max_bytes=10_000_000,
+                             max_chars=20_000, timeout=5)
+    assert summary["attempted"] == 3 and summary["fetched"] == 2
+    assert summary["failures"] == {"write-error:OSError": 1}
+
+    out = {r["url"].rsplit("/", 1)[1]: r for r in
+           (json.loads(l) for l in
+            (tmp_path / "round1" / "slice_web.jsonl").read_text().splitlines() if l.strip())}
+    assert "text_path" not in out["bad"]
+    assert "raw_path" not in out["rawbad.pdf"] and "text_path" in out["rawbad.pdf"]
+    assert "text_path" in out["good"]
+    assert (tmp_path / "round1" / "fulltext_manifest.json").exists()
