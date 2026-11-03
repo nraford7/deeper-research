@@ -152,28 +152,59 @@ def split_keyed_entry(entry: str):
     return authors, m.group("year"), (title or authors)[:300], tag
 
 
-def _bibtex_authors_from_head(authors: str) -> str:
-    """BibTeX author field from a keyed head: names joined with ``and``, which
-    is the only separator BibTeX reads (``Babuta, Oswald & Janjeva`` →
-    ``Babuta and Oswald and Janjeva``; ``Smith et al.`` → ``Smith and others``).
-    A head with no separator passes through unchanged. The head grammar has
-    no person/organisation marker, so an organisation whose own name holds a
-    separator (``Ernst & Young``) is split like a list of surnames; the raw
-    head stays in the ``note`` field."""
+_ET_AL_RE = re.compile(r"\bet\s+al\b\.?")
+
+
+def _split_head(authors: str):
+    """(names, others, organisation) for a keyed head. ``names`` are the
+    pieces between separators; ``others`` is True for ``et al.``. A head is an
+    organisation when any piece has more than one word: a surname list
+    (``Babuta, Oswald & Janjeva``) is single words, while ``Bill and Melinda
+    Gates Foundation`` or ``Ministry of Defence, Japan`` is not, and splitting
+    those would invent authors. An organisation whose pieces are all single
+    words (``Ernst & Young``) still reads as a surname list; the raw head stays
+    in the ``note`` field."""
     text = authors.strip()
-    others = bool(re.search(r"\bet\s+al\b\.?", text))
-    text = re.sub(r"\bet\s+al\b\.?", "", text)
+    others = bool(_ET_AL_RE.search(text))
+    text = _ET_AL_RE.sub("", text).strip(" ,;")
     names = [n.strip() for n in _AUTHOR_SPLIT_RE.split(text) if n.strip()]
+    organisation = any(len(n.split()) > 1 for n in names)
+    if organisation:
+        names = [text]
+    return names, others, organisation
+
+
+def _bibtex_authors_from_head(authors: str) -> str:
+    """Plain author names from a keyed head, joined with ``and``, which is the
+    only separator BibTeX reads (``Babuta, Oswald & Janjeva`` → ``Babuta and
+    Oswald and Janjeva``; ``Smith et al.`` → ``Smith and others``). An
+    organisation comes back whole (see _split_head)."""
+    names, others, _org = _split_head(authors)
     if others:
-        names.append("others")
+        names = names + ["others"]
     return " and ".join(names) if names else authors.strip()
 
 
+def _bibtex_author_field(authors: str) -> str:
+    """Escaped BibTeX author value for a keyed head. An organisation is
+    wrapped in braces so BibTeX reads it as one name and never splits it on
+    the ``and`` inside it (``{Bill and Melinda Gates Foundation}``)."""
+    names, others, org = _split_head(authors)
+    if not names:
+        return bibtex_escape(authors.strip())
+    parts = ["{" + bibtex_escape(n) + "}" if org else bibtex_escape(n) for n in names]
+    if others:
+        parts.append("others")
+    return " and ".join(parts)
+
+
 def _author_key_from_head(authors: str) -> str:
-    """BibTeX key stem from a keyed head: the first author/organisation, letters
-    and digits only (``Babuta, Oswald & Janjeva`` → ``Babuta``;
-    ``+972 Magazine`` → ``972Magazine``)."""
-    first = next((a for a in _AUTHOR_SPLIT_RE.split(authors) if a.strip()), authors)
+    """BibTeX key stem from a keyed head, letters and digits only: the first
+    author of a surname list (``Babuta, Oswald & Janjeva`` → ``Babuta``), or
+    the whole organisation (``+972 Magazine`` → ``972Magazine``; ``Bill and
+    Melinda Gates Foundation`` → ``BillandMelindaGatesFoundation``)."""
+    names, _others, _org = _split_head(authors)
+    first = names[0] if names else authors
     return re.sub(r"[^A-Za-z0-9]", "", first) or "Anon"
 
 
@@ -249,14 +280,18 @@ def to_bibtex_entry(entry: str, author_year_counter: dict) -> str:
         key = f"{base}{chr(ord('a') + seen)}"
     else:
         key = f"{base}_{seen}"
-    fields = [f"  author    = {{{bibtex_escape(authors)}}}",
-              f"  year      = {{{year}}}",
+    keyed = split_keyed_entry(entry)
+    author_field = _bibtex_author_field(keyed[0]) if keyed else bibtex_escape(authors)
+    # The key keeps a disambiguating letter (Smith2024a); the year field is
+    # the year itself.
+    year_field = re.sub(r"^(\d{4})[a-z]$", r"\1", year)
+    fields = [f"  author    = {{{author_field}}}",
+              f"  year      = {{{year_field}}}",
               f"  title     = {{{bibtex_escape(title)}}}"]
     if doi_m:
         fields.append(f"  doi       = {{{doi_m.group(0)}}}")
     if url_m:
         fields.append(f"  url       = {{{url_m.group(0)}}}")
-    keyed = split_keyed_entry(entry)
     if keyed and keyed[3]:
         # the run's own [tier · kind] tag, as comma-separated keywords
         parts = [t.strip() for t in keyed[3].split("·") if t.strip()]
