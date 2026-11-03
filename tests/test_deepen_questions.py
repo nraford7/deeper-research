@@ -462,3 +462,133 @@ def test_single_question_missing_bucket_exits_2(monkeypatch, tmp_path):
     rc = deepen_questions.main(
         ["--run-dir", str(tmp_path), "--single-question", "q"])
     assert rc == 2
+
+
+# ===========================================================================
+# single-question calls add to Round 2.5, never overwrite it (issue #9)
+# ===========================================================================
+
+def _single(monkeypatch, tmp_path, question, bucket, answer="A", cap=None):
+    session = FakeSession([_answer_body(answer, urls=["https://z.com/1"])])
+    _patch_common(monkeypatch, session)
+    argv = ["--run-dir", str(tmp_path), "--single-question", question, "--bucket", bucket]
+    if cap is not None:
+        argv += ["--max-retrieval-usd", str(cap)]
+    return deepen_questions.main(argv)
+
+
+def test_second_single_question_in_same_bucket_keeps_the_first(monkeypatch, tmp_path):
+    assert _single(monkeypatch, tmp_path, "Q1", "root_cause", answer="first") == 0
+    assert _single(monkeypatch, tmp_path, "Q2", "root_cause", answer="second") == 0
+    r25 = tmp_path / "round2_5"
+    files = sorted(p.name for p in r25.glob("answer_*_root_cause.md"))
+    assert files == ["answer_00_root_cause.md", "answer_01_root_cause.md"]
+    assert "first" in (r25 / "answer_00_root_cause.md").read_text()
+    assert "second" in (r25 / "answer_01_root_cause.md").read_text()
+    cov = json.loads((r25 / "coverage.json").read_text())
+    assert cov["questions"] == 2 and cov["answered"] == 2
+    assert cov["by_bucket"]["root_cause"] == 2
+
+
+def test_single_question_after_normal_pass_extends_it(monkeypatch, tmp_path):
+    # Normal 3-question pass first (indices 0..2, one grounding file each).
+    session = FakeSession([_answer_body("a"), _answer_body("b"), _answer_body("c")])
+    _patch_common(monkeypatch, session)
+    md = _md(root_cause=["r1"], consequence=["c1"], new_questions=["g1"])
+    assert deepen_questions.main(
+        ["--run-dir", str(tmp_path), "--round2-file", str(_write_round2(tmp_path, md))]) == 0
+    r25 = tmp_path / "round2_5"
+    before = {p.name: p.read_bytes() for p in r25.iterdir()}
+    assert "grounding_00.json" in before and "coverage.json" in before
+
+    # A Round-5 root-cause follow-up lands at index 3 in a different bucket
+    # than index 0 — grounding_00.json (not bucket-suffixed) must survive.
+    assert _single(monkeypatch, tmp_path, "Why really?", "gap", answer="deeper") == 0
+    assert (r25 / "answer_03_gap.md").exists()
+    assert (r25 / "grounding_03.json").exists()
+    for name, data in before.items():
+        if name != "coverage.json":
+            assert (r25 / name).read_bytes() == data, f"{name} was rewritten"
+    cov = json.loads((r25 / "coverage.json").read_text())
+    assert cov["questions"] == 4 and cov["answered"] == 4
+    assert cov["by_bucket"] == {"root_cause": 1, "consequence": 1, "gap": 2}
+
+
+def test_single_question_cap_refusal_merges_coverage(monkeypatch, tmp_path):
+    assert _single(monkeypatch, tmp_path, "Q1", "gap") == 0
+    # cap already spent by the ledger of the first call: the second is refused
+    rc = _single(monkeypatch, tmp_path, "Q2", "gap", cap=0.0)
+    assert rc == LedgerCapExceeded.EXIT_CODE
+    cov = json.loads((tmp_path / "round2_5" / "coverage.json").read_text())
+    assert cov["questions"] == 2 and cov["answered"] == 1
+    assert cov["by_bucket"]["gap"] == 1
+
+
+def test_normal_pass_still_numbers_from_zero(monkeypatch, tmp_path):
+    session = FakeSession([_answer_body("a")])
+    _patch_common(monkeypatch, session)
+    md = _md(root_cause=["r1"])
+    assert deepen_questions.main(
+        ["--run-dir", str(tmp_path), "--round2-file", str(_write_round2(tmp_path, md))]) == 0
+    assert (tmp_path / "round2_5" / "answer_00_root_cause.md").exists()
+
+
+def test_next_answer_index_reads_both_answer_and_grounding_files(tmp_path):
+    assert deepen_questions._next_answer_index(tmp_path / "missing") == 0
+    r25 = tmp_path / "round2_5"
+    r25.mkdir()
+    assert deepen_questions._next_answer_index(r25) == 0
+    (r25 / "answer_00_gap.md").write_text("x")
+    (r25 / "grounding_04.json").write_text("{}")
+    (r25 / "coverage.json").write_text("{}")
+    assert deepen_questions._next_answer_index(r25) == 5
+
+
+def test_extract_buckets_warns_when_header_has_no_items(capsys):
+    md = ("## Root Cause Questions\n"
+          "Why does the thing happen? It seems driven by X.\n\n"
+          "## Openings\n- a real bullet\n")
+    b1, b2, b3 = deepen_questions.extract_buckets(md)
+    assert b1 == [] and b3 == ["a real bullet"]
+    err = capsys.readouterr().err
+    assert "Root Cause Questions" in err and "no list items" in err
+    assert "Openings" not in err
+    # an absent header is not a warning (the common case)
+    capsys.readouterr()
+    deepen_questions.extract_buckets("## Openings\n- q\n")
+    assert "warning" not in capsys.readouterr().err
+
+
+def test_normal_rerun_sets_aside_stale_single_question_files(monkeypatch, tmp_path):
+    """A normal pass after Round-5 additions replaces the round: the earlier
+    answer/grounding files move to round2_5/superseded/, so nothing that globs
+    answer_*.md reads a stale answer beside the new ones."""
+    assert _single(monkeypatch, tmp_path, "Q1", "gap", answer="old") == 0
+    assert _single(monkeypatch, tmp_path, "Q2", "gap", answer="older") == 0
+    r25 = tmp_path / "round2_5"
+    assert (r25 / "answer_01_gap.md").exists()
+
+    session = FakeSession([_answer_body("fresh")])
+    _patch_common(monkeypatch, session)
+    md = _md(root_cause=["r1"])
+    assert deepen_questions.main(
+        ["--run-dir", str(tmp_path), "--round2-file", str(_write_round2(tmp_path, md))]) == 0
+    top = sorted(p.name for p in r25.iterdir() if p.is_file())
+    assert top == ["answer_00_root_cause.md", "coverage.json", "grounding_00.json"]
+    moved = sorted(p.name for p in (r25 / "superseded").rglob("*") if p.is_file())
+    assert moved == ["answer_00_gap.md", "answer_01_gap.md",
+                     "grounding_00.json", "grounding_01.json"]
+    assert json.loads((r25 / "coverage.json").read_text())["questions"] == 1
+
+
+def test_preflight_failure_leaves_prior_answers_in_place(monkeypatch, tmp_path):
+    """Nothing is moved unless the pass is actually about to call Exa."""
+    assert _single(monkeypatch, tmp_path, "Q1", "gap") == 0
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    monkeypatch.delenv("EXA_BASE_URL", raising=False)
+    md = _md(root_cause=["r1"])
+    rc = deepen_questions.main(
+        ["--run-dir", str(tmp_path), "--round2-file", str(_write_round2(tmp_path, md))])
+    assert rc == deepen_questions.EXA_PREFLIGHT_EXIT
+    assert (tmp_path / "round2_5" / "answer_00_gap.md").exists()
+    assert not (tmp_path / "round2_5" / "superseded").exists()
