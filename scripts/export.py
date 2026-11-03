@@ -101,6 +101,60 @@ def bibtex_escape(s: str) -> str:
 _LEADING_DOMAIN_RE = re.compile(r"^\s*([a-z0-9-]+(?:\.[a-z0-9-]+)+)\b")
 _ND_RE = re.compile(r"\bn\.d\.", re.IGNORECASE)
 
+# Keyed v2 bibliography lines lead with their citation key:
+#   [Abraham, 2024] — 'Lavender': The AI machine … — https://… (2024-04-03) [news · journalism]
+#   [Anduril, n.d.] — Command & Control — https://… ((none) [corporate · vendor]
+# The head IS the author/year signal; the trailing [tier · kind] tag is the
+# run's own classification and the optional <!-- … --> comment is provenance.
+_KEYED_HEAD_RE = re.compile(
+    r"^\s*\[(?P<authors>[^\[\]]+?),\s*(?P<year>(?:19|20)\d{2}[a-z]?|n\.d\.)\s*\]\s*(?:—\s*)?")
+_TRAILING_TAG_RE = re.compile(r"\s*\[(?P<tag>[^\[\]]*·[^\[\]]*)\]\s*$")
+_HTML_COMMENT_RE = re.compile(r"\s*<!--.*?-->\s*$", re.S)
+_AUTHOR_SPLIT_RE = re.compile(r"\s*(?:,|&|;|\band\b|\bet\s+al\b)\s*")
+_KEYED_SEP = " — "
+
+
+def split_keyed_entry(entry: str):
+    """Parse a keyed v2 line into (authors, year, title, tag) or None when the
+    line does not start with a ``[Key, YYYY]`` / ``[Key, n.d.]`` head.
+
+    The title is the ``—``-separated text between the head and the URL, minus a
+    short leading marker such as ``[PDF]``; ``tag`` is the trailing
+    ``tier · kind`` text without its brackets (None when absent)."""
+    m = _KEYED_HEAD_RE.match(entry)
+    if not m:
+        return None
+    rest = _HTML_COMMENT_RE.sub("", entry[m.end():])
+    tag = None
+    tm = _TRAILING_TAG_RE.search(rest)
+    if tm:
+        tag = tm.group("tag").strip()
+        rest = rest[:tm.start()]
+    title_segs = []
+    for seg in (s.strip() for s in rest.split(_KEYED_SEP)):
+        if URL_RE.match(seg):
+            break
+        if seg:
+            title_segs.append(seg)
+    title = _KEYED_SEP.join(title_segs)
+    url_m = URL_RE.search(title)
+    if url_m:                     # URL glued to the title with no separator
+        title = title[:url_m.start()]
+    title = re.sub(r"^\[[^\]]{1,12}\]\s*", "", title)   # [PDF], [JA], …
+    title = title.strip(" .,;")
+    if len(title) > 1 and title[0] == title[-1] and title[0] in "\"'":
+        title = title[1:-1].strip()   # a fully quoted title, not a leading 'scare quote'
+    authors = m.group("authors").strip()
+    return authors, m.group("year"), (title or authors)[:300], tag
+
+
+def _author_key_from_head(authors: str) -> str:
+    """BibTeX key stem from a keyed head: the first author/organisation, letters
+    and digits only (``Babuta, Oswald & Janjeva`` → ``Babuta``;
+    ``+972 Magazine`` → ``972Magazine``)."""
+    first = next((a for a in _AUTHOR_SPLIT_RE.split(authors) if a.strip()), authors)
+    return re.sub(r"[^A-Za-z0-9]", "", first) or "Anon"
+
 
 def extract_authors_year_title(entry: str):
     """Split a bibliography line into (author_key, year, authors, title).
@@ -108,7 +162,14 @@ def extract_authors_year_title(entry: str):
     Academic lines have a 4-digit year. Undated WEB lines (no year) are handled
     separately: the leading token is a bare domain, the year is `n.d.`, and the
     title is the text between the `n.d.` marker (or the domain) and the URL — so
-    the author/title fields are clean instead of a truncated dot-split."""
+    the author/title fields are clean instead of a truncated dot-split.
+    Keyed v2 lines (``[Key, YYYY] — title — url …``) take their author and
+    year from the head, see split_keyed_entry."""
+    keyed = split_keyed_entry(entry)
+    if keyed:
+        authors, year, title, _tag = keyed
+        return _author_key_from_head(authors), year, authors, title
+
     year_m = YEAR_RE.search(entry)
     if year_m:
         year = year_m.group(0)
@@ -173,6 +234,11 @@ def to_bibtex_entry(entry: str, author_year_counter: dict) -> str:
         fields.append(f"  doi       = {{{doi_m.group(0)}}}")
     if url_m:
         fields.append(f"  url       = {{{url_m.group(0)}}}")
+    keyed = split_keyed_entry(entry)
+    if keyed and keyed[3]:
+        # the run's own [tier · kind] tag, as comma-separated keywords
+        parts = [t.strip() for t in keyed[3].split("·") if t.strip()]
+        fields.append(f"  keywords  = {{{bibtex_escape(', '.join(parts))}}}")
     fields.append(f"  note      = {{{bibtex_escape(entry[:400])}}}")
     return "@misc{" + key + ",\n" + ",\n".join(fields) + "\n}"
 
