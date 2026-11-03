@@ -358,3 +358,49 @@ def test_lone_surrogate_in_pdf_text_does_not_sink_the_pass(monkeypatch, tmp_path
     assert "�" in written and "\ud83d" not in written
     assert bad_row["text_chars"] == len(written)
     assert (tmp_path / "round1" / "fulltext_manifest.json").exists()
+
+
+def test_write_errors_skip_the_row_not_the_pass(monkeypatch, tmp_path):
+    """Any per-row write error (full disk, bad path), not only a surrogate,
+    must skip that row and leave the rest of the pass and its manifest intact."""
+    from pathlib import Path
+
+    rows = [{"url": f"https://a.com/{n}", "slice": "web", "text_chars": 0, "tier": "web"}
+            for n in ("bad", "rawbad.pdf", "good")]
+    _write_slice(tmp_path, "web", rows)
+
+    def fake_get(url, mb, to):
+        if url.endswith(".pdf"):
+            return b"%PDF-1.4 fake", "application/pdf", url
+        tag = "POISON " if url.endswith("/bad") else ""
+        return (f"{tag}Readable body text follows. " * 50).encode(), "text/html", url
+
+    real_write_text, real_write_bytes = Path.write_text, Path.write_bytes
+
+    def write_text(self, data, *a, **k):
+        if "POISON" in data:
+            raise OSError(28, "No space left on device")
+        return real_write_text(self, data, *a, **k)
+
+    def write_bytes(self, data):
+        if self.suffix == ".pdf":
+            raise OSError(13, "Permission denied")
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(ff, "_safe_get", fake_get)
+    monkeypatch.setattr(ff, "_pdf_to_text", lambda data: "PDF body text. " * 60)
+    monkeypatch.setattr(Path, "write_text", write_text)
+    monkeypatch.setattr(Path, "write_bytes", write_bytes)
+
+    summary = ff.process_run(tmp_path, min_chars=400, max_bytes=10_000_000,
+                             max_chars=20_000, timeout=5)
+    assert summary["attempted"] == 3 and summary["fetched"] == 2
+    assert summary["failures"] == {"write-error:OSError": 1}
+
+    out = {r["url"].rsplit("/", 1)[1]: r for r in
+           (json.loads(l) for l in
+            (tmp_path / "round1" / "slice_web.jsonl").read_text().splitlines() if l.strip())}
+    assert "text_path" not in out["bad"]
+    assert "raw_path" not in out["rawbad.pdf"] and "text_path" in out["rawbad.pdf"]
+    assert "text_path" in out["good"]
+    assert (tmp_path / "round1" / "fulltext_manifest.json").exists()
