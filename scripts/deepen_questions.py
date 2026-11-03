@@ -49,6 +49,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -166,7 +167,7 @@ def make_session():
 # Ingestion — tolerant markdown header extraction (NEVER raises)
 # ---------------------------------------------------------------------------
 
-_NUMBERED = __import__("re").compile(r"^\d+[.)]\s+")
+_NUMBERED = re.compile(r"^\d+[.)]\s+")
 
 
 def _bullets_under(md, header):
@@ -210,6 +211,19 @@ def extract_buckets(md):
         b1 = _bullets_under(md, _HEADER_ROOT_CAUSE)
         b2 = _bullets_under(md, _HEADER_CONSEQUENCE)
         b3 = _bullets_under(md, _HEADER_NEW) + _bullets_under(md, _HEADER_OPENINGS)
+        # A header that is present but yields nothing is almost always a
+        # synthesizer that wrote its questions as paragraphs instead of list
+        # items. Silently empty buckets hand the whole 9-question budget to
+        # the others, so say so.
+        headers = md.split("\n")
+        for header, items in ((_HEADER_ROOT_CAUSE, b1), (_HEADER_CONSEQUENCE, b2),
+                              (_HEADER_NEW, None), (_HEADER_OPENINGS, None)):
+            present = any(line.strip() == header for line in headers)
+            empty = not items if items is not None else not _bullets_under(md, header)
+            if present and empty:
+                print(f"  ⚠ warning: '{header}' is present but has no list items "
+                      f"(- / * / 1.) — its questions were not ingested",
+                      file=sys.stderr)
         return b1, b2, b3
     except Exception as exc:  # noqa: BLE001 — tolerant by construction
         print(f"  ⚠ warning: Round-2 markdown malformed, ingesting empty buckets "
@@ -502,6 +516,48 @@ def _write_coverage(round25_dir, questions, answered, by_bucket):
         json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _merge_coverage(round25_dir, questions, answered, by_bucket):
+    """Add this call's counts to an existing coverage.json instead of
+    replacing it — the single-question (Round-5) entry runs AFTER the normal
+    pass and must not erase its record. An unreadable file is treated as
+    empty."""
+    prior = {}
+    try:
+        prior = json.loads((round25_dir / "coverage.json").read_text(encoding="utf-8"))
+        if not isinstance(prior, dict):
+            prior = {}
+    except (OSError, ValueError):
+        prior = {}
+    merged_buckets = dict(prior.get("by_bucket") or {})
+    for bucket, n in by_bucket.items():
+        merged_buckets[bucket] = int(merged_buckets.get(bucket, 0) or 0) + n
+    _write_coverage(round25_dir,
+                    int(prior.get("questions", 0) or 0) + questions,
+                    int(prior.get("answered", 0) or 0) + answered,
+                    merged_buckets)
+
+
+_ANSWER_INDEX_RE = re.compile(r"^(?:answer|grounding)_(\d+)(?:_|\.)")
+
+
+def _next_answer_index(round25_dir):
+    """First index no existing answer_NN_<bucket>.md or grounding_NN.json uses.
+
+    Single-question calls used to start at 0 every time, so a second call in
+    the same bucket overwrote the first answer, and a call in a different
+    bucket overwrote grounding_00.json (which is not bucket-suffixed)."""
+    highest = -1
+    try:
+        names = [p.name for p in round25_dir.iterdir()]
+    except OSError:
+        return 0
+    for name in names:
+        m = _ANSWER_INDEX_RE.match(name)
+        if m:
+            highest = max(highest, int(m.group(1)))
+    return highest + 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-dir", required=True)
@@ -520,7 +576,8 @@ def main(argv=None):
     round25_dir = layout.round2_5
 
     # Build the allocation (bucket, question) pairs.
-    if args.single_question is not None:
+    single = args.single_question is not None
+    if single:
         if not args.bucket:
             print("--single-question requires --bucket", file=sys.stderr)
             return 2
@@ -541,6 +598,12 @@ def main(argv=None):
     run_cfg = config.load_run_config()
     cap = args.max_retrieval_usd if args.max_retrieval_usd is not None else run_cfg.max_retrieval_usd
 
+    # A single-question call is an ADDITION to whatever Round 2.5 already
+    # produced: number its files after the existing ones and add its counts to
+    # coverage.json. The normal path is a full pass and still writes from 0.
+    start_idx = _next_answer_index(round25_dir) if single else 0
+    write_coverage = _merge_coverage if single else _write_coverage
+
     n_questions = len(pairs)
     by_bucket_total = {"root_cause": 0, "consequence": 0, "gap": 0}
     by_bucket_answered = {"root_cause": 0, "consequence": 0, "gap": 0}
@@ -550,7 +613,7 @@ def main(argv=None):
     # No questions → write a zeroed coverage file and exit clean (no Exa call,
     # so no key needed).
     if n_questions == 0:
-        _write_coverage(round25_dir, 0, 0, by_bucket_answered)
+        write_coverage(round25_dir, 0, 0, by_bucket_answered)
         print("Round-2.5 deepening: no questions to deepen (coverage written).")
         return 0
 
@@ -569,13 +632,13 @@ def main(argv=None):
     round25_dir.mkdir(parents=True, exist_ok=True)
 
     answered = 0
-    for idx, (bucket, question) in enumerate(pairs):
+    for idx, (bucket, question) in enumerate(pairs, start=start_idx):
         try:
             ok = run_question(idx, bucket, question, session, api_key,
                               ledger, round25_dir)
         except LedgerCapExceeded as exc:
             # Refusal is an exit, never a silent skip: write coverage FIRST.
-            _write_coverage(round25_dir, n_questions, answered, by_bucket_answered)
+            write_coverage(round25_dir, n_questions, answered, by_bucket_answered)
             print(f"  ✗ retrieval cap reached: {exc}", file=sys.stderr)
             print("    coverage.json written reflecting the shortfall. "
                   "Raise --max-retrieval-usd to continue.", file=sys.stderr)
@@ -584,7 +647,7 @@ def main(argv=None):
             answered += 1
             by_bucket_answered[bucket] = by_bucket_answered.get(bucket, 0) + 1
 
-    _write_coverage(round25_dir, n_questions, answered, by_bucket_answered)
+    write_coverage(round25_dir, n_questions, answered, by_bucket_answered)
     print(f"Round-2.5 deepening complete: {answered}/{n_questions} answered, "
           f"committed=${ledger.committed():.4f}")
     return 0
