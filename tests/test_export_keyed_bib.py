@@ -43,7 +43,7 @@ def test_organisation_head_with_leading_plus_sign():
              " in Gaza — https://www.972mag.com/lavender-ai-israeli-army-gaza/ (2024-04-03)"
              " [news · journalism]")
     key, year, authors, title = extract_authors_year_title(entry)
-    assert (key, year, authors) == ("972Magazine", "2024", "+972 Magazine")
+    assert (key, year, authors) == ("972Magazine", "2024", "+972 Magazine")  # one organisation, unsplit
     assert title.startswith("'Lavender'")
     assert to_bibtex_entry(entry, {}).startswith("@misc{972Magazine2024,")
 
@@ -55,7 +55,7 @@ def test_multi_author_head_keys_on_the_first_author():
     bt = to_bibtex_entry(entry, {})
     assert bt.startswith("@misc{Babuta2020,")
     f = _fields(bt)
-    assert f["author"] == "Babuta, Oswald \\& Janjeva"
+    assert f["author"] == "Babuta and Oswald and Janjeva"   # BibTeX name separator
     assert f["title"] == "Artificial Intelligence and UK National Security: Policy Considerations"
     assert f["keywords"] == "think-tank report, research"
 
@@ -114,3 +114,26 @@ def test_duplicate_keyed_heads_get_suffixes_not_anon():
     keys = [to_bibtex_entry(e, counter).split(",")[0] for e in parse_bib_entries(bib)]
     # (the existing collision scheme letters the second entry "b")
     assert keys == ["@misc{Abraham2024", "@misc{Abraham2024b", "@misc{Abraham2025"]
+
+
+def test_bibtex_authors_from_head_separators():
+    from scripts.export import _bibtex_authors_from_head as names
+    assert names("Kanda") == "Kanda"
+    assert names("Beck & Plumb") == "Beck and Plumb"
+    assert names("Babuta, Oswald & Janjeva") == "Babuta and Oswald and Janjeva"
+    assert names("Smith et al.") == "Smith and others"
+    assert names("Lee and Park") == "Lee and Park"
+
+
+def test_historical_year_takes_the_keyed_path_end_to_end():
+    """[Darwin, 1859] is a valid keyed line (the inline grammar accepts any
+    four-digit year); it used to fall through to Anonnd / n.d."""
+    bib = "- [Darwin, 1859] — On the Origin of Species — https://example.org/origin [book · primary]\n"
+    entries = parse_bib_entries(bib)
+    assert len(entries) == 1
+    bt = to_bibtex_entry(entries[0], {})
+    assert bt.startswith("@misc{Darwin1859,")
+    f = _fields(bt)
+    assert f["author"] == "Darwin" and f["year"] == "1859"
+    assert f["title"] == "On the Origin of Species"
+    assert f["keywords"] == "book, primary"

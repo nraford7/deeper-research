@@ -106,8 +106,10 @@ _ND_RE = re.compile(r"\bn\.d\.", re.IGNORECASE)
 #   [Anduril, n.d.] — Command & Control — https://… ((none) [corporate · vendor]
 # The head IS the author/year signal; the trailing [tier · kind] tag is the
 # run's own classification and the optional <!-- … --> comment is provenance.
+# Any four-digit year, like the inline citation grammar (a keyed [Darwin, 1859]
+# is a valid bibliography line), not just 19xx/20xx.
 _KEYED_HEAD_RE = re.compile(
-    r"^\s*\[(?P<authors>[^\[\]]+?),\s*(?P<year>(?:19|20)\d{2}[a-z]?|n\.d\.)\s*\]\s*(?:—\s*)?")
+    r"^\s*\[(?P<authors>[^\[\]]+?),\s*(?P<year>\d{4}[a-z]?|n\.d\.)\s*\]\s*(?:—\s*)?")
 _TRAILING_TAG_RE = re.compile(r"\s*\[(?P<tag>[^\[\]]*·[^\[\]]*)\]\s*$")
 _HTML_COMMENT_RE = re.compile(r"\s*<!--.*?-->\s*$", re.S)
 _AUTHOR_SPLIT_RE = re.compile(r"\s*(?:,|&|;|\band\b|\bet\s+al\b)\s*")
@@ -148,6 +150,20 @@ def split_keyed_entry(entry: str):
     return authors, m.group("year"), (title or authors)[:300], tag
 
 
+def _bibtex_authors_from_head(authors: str) -> str:
+    """BibTeX author field from a keyed head: names joined with ``and``, which
+    is the only separator BibTeX reads (``Babuta, Oswald & Janjeva`` →
+    ``Babuta and Oswald and Janjeva``; ``Smith et al.`` → ``Smith and others``).
+    A single name or an organisation passes through unchanged."""
+    text = authors.strip()
+    others = bool(re.search(r"\bet\s+al\b\.?", text))
+    text = re.sub(r"\bet\s+al\b\.?", "", text)
+    names = [n.strip() for n in _AUTHOR_SPLIT_RE.split(text) if n.strip()]
+    if others:
+        names.append("others")
+    return " and ".join(names) if names else authors.strip()
+
+
 def _author_key_from_head(authors: str) -> str:
     """BibTeX key stem from a keyed head: the first author/organisation, letters
     and digits only (``Babuta, Oswald & Janjeva`` → ``Babuta``;
@@ -168,7 +184,8 @@ def extract_authors_year_title(entry: str):
     keyed = split_keyed_entry(entry)
     if keyed:
         authors, year, title, _tag = keyed
-        return _author_key_from_head(authors), year, authors, title
+        return (_author_key_from_head(authors), year,
+                _bibtex_authors_from_head(authors), title)
 
     year_m = YEAR_RE.search(entry)
     if year_m:
