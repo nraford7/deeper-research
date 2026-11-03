@@ -51,6 +51,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from scripts.helper_runtime import require_managed_mutation, resolve_helper_layout
@@ -558,6 +559,26 @@ def _next_answer_index(round25_dir):
     return highest + 1
 
 
+def _set_aside_prior_answers(round25_dir):
+    """Move every answer_NN_<bucket>.md and grounding_NN.json from an earlier
+    pass into round2_5/superseded/<UTC stamp>/ before a normal pass rewrites
+    the round. Without this, a rerun leaves stale Round-5 single-question
+    files (and same-index files from another bucket) beside the new answers,
+    and every reader that globs answer_*.md picks them up. Moved, not deleted:
+    those answers were paid for."""
+    stale = [p for p in round25_dir.iterdir()
+             if p.is_file() and _ANSWER_INDEX_RE.match(p.name)]
+    if not stale:
+        return 0
+    dest = round25_dir / "superseded" / time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    dest.mkdir(parents=True, exist_ok=True)
+    for p in stale:
+        p.replace(dest / p.name)
+    print(f"  · moved {len(stale)} earlier Round-2.5 file(s) to "
+          f"{dest.relative_to(round25_dir)}", file=sys.stderr)
+    return len(stale)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-dir", required=True)
@@ -630,6 +651,8 @@ def main(argv=None):
     ledger = RetrievalLedger(layout, cap)
     session = make_session()
     round25_dir.mkdir(parents=True, exist_ok=True)
+    if not single:
+        _set_aside_prior_answers(round25_dir)
 
     answered = 0
     for idx, (bucket, question) in enumerate(pairs, start=start_idx):

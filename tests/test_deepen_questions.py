@@ -557,3 +557,38 @@ def test_extract_buckets_warns_when_header_has_no_items(capsys):
     capsys.readouterr()
     deepen_questions.extract_buckets("## Openings\n- q\n")
     assert "warning" not in capsys.readouterr().err
+
+
+def test_normal_rerun_sets_aside_stale_single_question_files(monkeypatch, tmp_path):
+    """A normal pass after Round-5 additions replaces the round: the earlier
+    answer/grounding files move to round2_5/superseded/, so nothing that globs
+    answer_*.md reads a stale answer beside the new ones."""
+    assert _single(monkeypatch, tmp_path, "Q1", "gap", answer="old") == 0
+    assert _single(monkeypatch, tmp_path, "Q2", "gap", answer="older") == 0
+    r25 = tmp_path / "round2_5"
+    assert (r25 / "answer_01_gap.md").exists()
+
+    session = FakeSession([_answer_body("fresh")])
+    _patch_common(monkeypatch, session)
+    md = _md(root_cause=["r1"])
+    assert deepen_questions.main(
+        ["--run-dir", str(tmp_path), "--round2-file", str(_write_round2(tmp_path, md))]) == 0
+    top = sorted(p.name for p in r25.iterdir() if p.is_file())
+    assert top == ["answer_00_root_cause.md", "coverage.json", "grounding_00.json"]
+    moved = sorted(p.name for p in (r25 / "superseded").rglob("*") if p.is_file())
+    assert moved == ["answer_00_gap.md", "answer_01_gap.md",
+                     "grounding_00.json", "grounding_01.json"]
+    assert json.loads((r25 / "coverage.json").read_text())["questions"] == 1
+
+
+def test_preflight_failure_leaves_prior_answers_in_place(monkeypatch, tmp_path):
+    """Nothing is moved unless the pass is actually about to call Exa."""
+    assert _single(monkeypatch, tmp_path, "Q1", "gap") == 0
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    monkeypatch.delenv("EXA_BASE_URL", raising=False)
+    md = _md(root_cause=["r1"])
+    rc = deepen_questions.main(
+        ["--run-dir", str(tmp_path), "--round2-file", str(_write_round2(tmp_path, md))])
+    assert rc == deepen_questions.EXA_PREFLIGHT_EXIT
+    assert (tmp_path / "round2_5" / "answer_00_gap.md").exists()
+    assert not (tmp_path / "round2_5" / "superseded").exists()

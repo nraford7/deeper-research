@@ -569,7 +569,9 @@ Round 1: a per-question fail-open skips + continues (exit 0); a cap breach write
 `coverage.json` FIRST, then exits `21`.
 A `--single-question` call (Round 5) is an addition, not a redo: its answer and
 grounding files take the next free `NN` and its counts are added to the existing
-`coverage.json`; only the normal `--round2-file` pass numbers from `00`.
+`coverage.json`; only the normal `--round2-file` pass numbers from `00`. A normal
+pass replaces the round: it first moves earlier answer and grounding files to
+`round2_5/superseded/<stamp>/`, which is an archive, not an integration input.
 
 Each answer file also carries a `## Evidence` block — the retained Exa
 highlights/grounding the model actually saw — with the raw evidence saved as
